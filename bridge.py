@@ -13,7 +13,7 @@ import redis
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 QUEUE_NAME = os.getenv("QUEUE_NAME", "queue:openclaw_tasks")
-BRIDGE_PORT = int(os.getenv("BRIDGE_PORT", "5000")) # Porta padrão common para webhooks
+BRIDGE_PORT = int(os.getenv("BRIDGE_PORT", "5050")) # Porta 5050 para evitar conflitos no macOS (AirPlay)
 
 # Logging Setup
 logging.basicConfig(
