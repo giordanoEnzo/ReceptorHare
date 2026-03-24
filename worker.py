@@ -92,7 +92,7 @@ def call_openclaw_sessions_send(message_obj: dict) -> (bool, str):
     Invoca a CLI do OpenClaw para enviar a mensagem à sessão do Lapin.
     """
     json_compact = json.dumps(message_obj, separators=(',', ':'))
-    cmd = [OPENCLAW_BIN, "sessions_send", f"--sessionKey={LAPIN_SESSION_KEY}", f"--message={json_compact}"]
+    cmd = [OPENCLAW_BIN, "agent", f"--session-id={LAPIN_SESSION_KEY}", f"--message={json_compact}"]
     
     try:
         logger.debug("Executando CLI OpenClaw...")
@@ -102,7 +102,7 @@ def call_openclaw_sessions_send(message_obj: dict) -> (bool, str):
         combined_output = (proc.stdout or "") + (proc.stderr or "")
         
         if proc.returncode == 0:
-            logger.info("Comando 'sessions_send' executado com sucesso.")
+            logger.info("Comando 'agent' executado com sucesso.")
             return True, combined_output.strip()
         else:
             logger.error("CLI falhou (Exit Code %s): %s", proc.returncode, combined_output.strip())
