@@ -144,12 +144,39 @@ def call_openclaw_sessions_send(message_obj: dict) -> (bool, str):
     except Exception as e:
         return False, str(e)
 
+def forward_to_webhook(url: str, task_data: dict) -> (bool, str):
+    """
+    Forwards the task data to a custom webhook URL via HTTP POST.
+    """
+    try:
+        logger.info("Encaminhando tarefa para Webhook: %s", url)
+        resp = HTTP.post(url, json=task_data, timeout=CALLBACK_TIMEOUT)
+        if 200 <= resp.status_code < 300:
+            logger.info("✅ Webhook notificado com sucesso (Status %s).", resp.status_code)
+            return True, "Sucesso"
+        else:
+            logger.error("❌ Webhook retornou erro: Status %s - %s", resp.status_code, resp.text)
+            return False, f"HTTP Error {resp.status_code}"
+    except Exception as e:
+        logger.error("❌ Erro ao enviar para o Webhook: %s", e)
+        return False, str(e)
+
 def build_external_event_message(task_data: dict) -> dict:
     """
     Mapeia os dados do seu sistema para o formato esperado pelo Lapin.
     """
     req_id = task_data.get("id") or f"gen-{int(time.time())}"
     
+    action_type = task_data.get("action", "created")
+    action_label = {
+        "created": "Nova task",
+        "updated": "Task atualizada",
+        "deleted": "Task excluída"
+    }.get(action_type, "Task")
+
+    metadata = task_data.get("metadata", {})
+    metadata["action_type"] = action_type
+
     return {
         "type": "external.event",
         "source": "webhook_redis_bridge",
@@ -161,10 +188,10 @@ def build_external_event_message(task_data: dict) -> dict:
                 "title": task_data.get("title", "Tarefa Sem Título"),
                 "description": task_data.get("description", ""),
                 "priority": task_data.get("priority", "normal"),
-                "metadata": task_data.get("metadata", {})
+                "metadata": metadata
             }
         },
-        "text": f"Nova task da HareWare: {task_data.get('title')}"
+        "text": f"{action_label} da HareWare: {task_data.get('title')}"
     }
 
 def process_item(redis_client: redis.Redis, raw_item: str):
@@ -179,23 +206,39 @@ def process_item(redis_client: redis.Redis, raw_item: str):
         return
 
     task_id = task_data.get("id")
+    notification_url = task_data.get("notification_url")
+
+    # 1. Forward to Webhook if available
+    webhook_success = True
+    if notification_url:
+        webhook_success, webhook_error = forward_to_webhook(notification_url, task_data)
+        if not webhook_success:
+            logger.warning("Falha ao notificar Webhook: %s", webhook_error)
+    
+    # 2. Forward to OpenClaw CLI (Original logic)
     message_obj = build_external_event_message(task_data)
+    cli_success = False
+    cli_output = ""
 
     for attempt in range(1, MAX_SEND_ATTEMPTS + 1):
-        success, output = call_openclaw_sessions_send(message_obj)
+        cli_success, cli_output = call_openclaw_sessions_send(message_obj)
         
-        if success:
-            # Notifica a API que a tarefa entrou em processamento no Lapin
-            if os.getenv("UPDATE_API_AFTER_ENQUEUE", "true").lower() == "true":
-                update_task_status_api(task_id, "Em processamento", "Enviada com sucesso para o agente Lapin.")
-            return
+        if cli_success:
+            break
         
-        logger.warning("Falha ao enviar para OpenClaw (Tentativa %d/%d)", attempt, MAX_SEND_ATTEMPTS)
+        logger.warning("Falha ao enviar para OpenClaw CLI (Tentativa %d/%d)", attempt, MAX_SEND_ATTEMPTS)
         if attempt < MAX_SEND_ATTEMPTS:
             time.sleep(BACKOFF_BASE ** (attempt - 1))
 
-    logger.error("Tarefa %s falhou após todas as tentativas.", task_id)
-    push_error_queue(redis_client, task_data, f"CLI_FAILURE: {output}")
+    # Determine final result (at least one must succeed)
+    if webhook_success or cli_success:
+        # Notifica a API que a tarefa entrou em processamento
+        if os.getenv("UPDATE_API_AFTER_ENQUEUE", "true").lower() == "true":
+            update_task_status_api(task_id, "Em processamento", "Tarefa encaminhada com sucesso.")
+        return
+
+    logger.error("Tarefa %s falhou (Webhook e CLI).", task_id)
+    push_error_queue(redis_client, task_data, f"FAILURE: Webhook({webhook_success}), CLI({cli_success}) - {cli_output}")
 
 def run_loop():
     logger.info("🚀 Worker HareWare iniciado. Monitorando Redis: %s", REDIS_URL)
