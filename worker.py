@@ -31,7 +31,7 @@ CLI_TIMEOUT = int(os.getenv("CLI_TIMEOUT", "120")) # 2 Minutos de margem de segu
 
 # --- Credenciais de Autenticação para o Callback ---
 AUTH_URL = os.getenv("AUTH_URL", "https://service-system.hareware.com.br/api/v1/auth/login")
-LAPIN_USERNAME = os.getenv("LAPIN_USERNAME", "Lapin")
+LAPIN_USERNAME = os.getenv("LAPIN_USERNAME", "lapin@hareware.com.br")
 LAPIN_PASSWORD = os.getenv("LAPIN_PASSWORD", "Lapin@2026")
 
 # Logging Setup
@@ -62,7 +62,8 @@ def login_to_api():
     try:
         logger.info("Tentando autenticar na API : %s", LAPIN_USERNAME)
         payload = {"username": LAPIN_USERNAME, "password": LAPIN_PASSWORD}
-        resp = HTTP.post(AUTH_URL, json=payload, timeout=CALLBACK_TIMEOUT)
+        # Enviando como x-www-form-urlencoded (parâmetro 'data')
+        resp = HTTP.post(AUTH_URL, data=payload, timeout=CALLBACK_TIMEOUT)
         
         if 200 <= resp.status_code < 300:
             data = resp.json()
