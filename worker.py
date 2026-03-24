@@ -29,6 +29,11 @@ CALLBACK_TIMEOUT = float(os.getenv("CALLBACK_TIMEOUT", "10.0")) # Aumentado para
 MAX_CALLBACK_RETRIES = int(os.getenv("MAX_CALLBACK_RETRIES", "3"))
 CLI_TIMEOUT = int(os.getenv("CLI_TIMEOUT", "120")) # 2 Minutos de margem de segurança
 
+# --- Credenciais de Autenticação para o Callback ---
+AUTH_URL = os.getenv("AUTH_URL", "https://service-system.hareware.com.br/api/v1/auth/login")
+LAPIN_EMAIL = os.getenv("LAPIN_EMAIL", "lapin@hareware.com.br")
+LAPIN_PASSWORD = os.getenv("LAPIN_PASSWORD", "Lapin@2026")
+
 # Logging Setup
 logging.basicConfig(
     level=LOG_LEVEL,
@@ -49,6 +54,29 @@ signal.signal(signal.SIGTERM, handle_sigterm)
 # Sessão HTTP persistente para performance nos callbacks
 HTTP = requests.Session()
 HTTP.headers.update({"User-Agent": "hareware-worker/1.1"})
+
+def login_to_api():
+    """
+    Autentica na API e injeta o Token JWT nos headers da sessão.
+    """
+    try:
+        logger.info("Tentando autenticar na API : %s", LAPIN_EMAIL)
+        payload = {"email": LAPIN_EMAIL, "password": LAPIN_PASSWORD}
+        resp = HTTP.post(AUTH_URL, json=payload, timeout=CALLBACK_TIMEOUT)
+        
+        if 200 <= resp.status_code < 300:
+            data = resp.json()
+            # Tenta pegar o token por diferentes nomes possíveis na resposta
+            token = data.get("access_token") or data.get("token") or data.get("data", {}).get("token")
+            
+            if token:
+                HTTP.headers.update({"Authorization": f"Bearer {token}"})
+                logger.info("✅ Login efetuado com sucesso na API HareWare.")
+                return True
+        logger.error("❌ Falha no login da API: Status %s - %s", resp.status_code, resp.text)
+    except Exception as e:
+        logger.error("❌ Erro durante a tentativa de login: %s", e)
+    return False
 
 def push_error_queue(redis_client: redis.Redis, original_task: dict, error_msg: str):
     try:
@@ -170,6 +198,9 @@ def process_item(redis_client: redis.Redis, raw_item: str):
 
 def run_loop():
     logger.info("🚀 Worker HareWare iniciado. Monitorando Redis: %s", REDIS_URL)
+    
+    # Realiza login inicial antes de entrar no loop
+    login_to_api()
     
     while not SHUTDOWN:
         try:
