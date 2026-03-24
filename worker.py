@@ -21,7 +21,7 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 QUEUE_NAME = os.getenv("QUEUE_NAME", "queue:openclaw_tasks")
 ERROR_QUEUE = os.getenv("ERROR_QUEUE", "queue:openclaw_errors")
 API_CALLBACK_URL = os.getenv("API_CALLBACK_URL", "https://service-system.hareware.com.br/api/v1/assignments/tasks")
-LAPIN_SESSION_KEY = os.getenv("LAPIN_SESSION_KEY", "agent:lapin:main")
+LAPIN_SESSION_KEY = os.getenv("LAPIN_SESSION_KEY", "lapin") # ID do agente no OpenClaw (Ex: lapin)
 OPENCLAW_BIN = os.getenv("OPENCLAW_BIN", "openclaw")
 MAX_SEND_ATTEMPTS = int(os.getenv("MAX_SEND_ATTEMPTS", "3"))
 BACKOFF_BASE = float(os.getenv("BACKOFF_BASE", "2.0"))
@@ -92,7 +92,7 @@ def call_openclaw_sessions_send(message_obj: dict) -> (bool, str):
     Invoca a CLI do OpenClaw para enviar a mensagem à sessão do Lapin.
     """
     json_compact = json.dumps(message_obj, separators=(',', ':'))
-    cmd = [OPENCLAW_BIN, "agent", f"--session-id={LAPIN_SESSION_KEY}", f"--message={json_compact}"]
+    cmd = [OPENCLAW_BIN, "agent", f"--agent={LAPIN_SESSION_KEY}", f"--message={json_compact}"]
     
     try:
         logger.debug("Executando CLI OpenClaw...")
