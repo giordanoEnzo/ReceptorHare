@@ -107,7 +107,7 @@ def update_task_status_api(task_id: str, status: str, log: str) -> bool:
             if 200 <= resp.status_code < 300:
                 logger.info("API HareWare atualizada: Task %s -> %s", task_id, status)
                 return True
-            logger.warning("API retornou status %s na tentativa %d", resp.status_code, attempt)
+            logger.warning("API retornou status %s na tentativa %d. Detalhes: %s", resp.status_code, attempt, resp.text)
         except requests.RequestException as e:
             logger.warning("Erro de conexão com a API (Tentativa %d): %s", attempt, e)
         
