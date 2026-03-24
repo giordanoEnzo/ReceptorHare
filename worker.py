@@ -1,129 +1,200 @@
-import redis
+#!/usr/bin/env python3
+"""
+openclaw_enqueue_worker.py
+Redis consumer that forwards tasks to Lapin via `openclaw sessions_send`.
+"""
+import os
 import json
 import time
-import requests
 import logging
-import os
-from typing import Optional
+import signal
+import shlex
+import subprocess
+from contextlib import suppress
 
-# Setup logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger("OpenClawWorker")
+import redis
+import requests
 
-# Configuration (In production, use environment variables)
+# --- Configurações via Variáveis de Ambiente ---
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-QUEUE_NAME = "queue:openclaw_tasks"
-ERROR_QUEUE = "queue:openclaw_errors"
+QUEUE_NAME = os.getenv("QUEUE_NAME", "queue:openclaw_tasks")
+ERROR_QUEUE = os.getenv("ERROR_QUEUE", "queue:openclaw_errors")
 API_CALLBACK_URL = os.getenv("API_CALLBACK_URL", "http://localhost:8000/api/v1/assignments/tasks")
-MAX_RETRIES = 3
+LAPIN_SESSION_KEY = os.getenv("LAPIN_SESSION_KEY", "agent:lapin:main")
+OPENCLAW_BIN = os.getenv("OPENCLAW_BIN", "openclaw")
+MAX_SEND_ATTEMPTS = int(os.getenv("MAX_SEND_ATTEMPTS", "3"))
+BACKOFF_BASE = float(os.getenv("BACKOFF_BASE", "2.0"))
+CALLBACK_TIMEOUT = float(os.getenv("CALLBACK_TIMEOUT", "10.0")) # Aumentado para segurança da rede
+MAX_CALLBACK_RETRIES = int(os.getenv("MAX_CALLBACK_RETRIES", "3"))
+CLI_TIMEOUT = int(os.getenv("CLI_TIMEOUT", "120")) # 2 Minutos de margem de segurança
 
-# Placeholder for OpenClaw integration
-# Note: You need to install the openclaw package: pip install openclaw
-try:
-    from openclaw import OpenClawAgent
-except ImportError:
-    logger.warning("OpenClaw package not found. Using a mock agent for demonstration.")
-    class OpenClawAgent:
-        def __init__(self, name="HareAgent"):
-            self.name = name
-        
-        def run(self, task_description):
-            logger.info(f"Agent {self.name} is processing: {task_description}")
-            # Simulate processing time
-            time.sleep(2)
-            return {"status": "success", "log": f"Task processed by {self.name}"}
+# Logging Setup
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+logger = logging.getLogger("HareWare-OpenClaw-Worker")
 
-def update_task_status(task_id: str, status: str, log: str):
-    """
-    Sends a PATCH request to the API to update the task status.
-    """
-    url = f"{API_CALLBACK_URL}/{task_id}"
-    payload = {
-        "status": status,
-        "description": log # Or a dedicated field if exists
-    }
+SHUTDOWN = False
+
+def handle_sigterm(signum, frame):
+    global SHUTDOWN
+    logger.info("Encadeando desligamento seguro (Signal=%s)...", signum)
+    SHUTDOWN = True
+
+signal.signal(signal.SIGINT, handle_sigterm)
+signal.signal(signal.SIGTERM, handle_sigterm)
+
+# Sessão HTTP persistente para performance nos callbacks
+HTTP = requests.Session()
+HTTP.headers.update({"User-Agent": "hareware-worker/1.1"})
+
+def push_error_queue(redis_client: redis.Redis, original_task: dict, error_msg: str):
     try:
-        # Note: You might need an Auth token here depending on your API security
-        response = requests.put(url, json=payload)
-        response.raise_for_status()
-        logger.info(f"Task {task_id} updated to {status}")
-    except Exception as e:
-        logger.error(f"Failed to update task {task_id}: {e}")
-
-def process_task(task_data_json: str):
-    try:
-        task_data = json.loads(task_data_json)
-        task_id = task_data.get("id")
-        title = task_data.get("title")
-        description = task_data.get("description")
-        
-        logger.info(f"Processing task {task_id}: {title}")
-        
-        # Instantiate OpenClaw Agent
-        agent = OpenClawAgent(name="HareAI-Manager")
-        
-        # In a real scenario, you'd pass more context to the agent
-        execution_result = agent.run(f"Title: {title}\nDescription: {description}")
-        
-        if execution_result.get("status") == "success":
-            # Update API with success
-            # Mapping status to TaskStatus.FINALIZADA (from app.models.assignment)
-            # "Finalizada" is the string used in the Enum
-            update_task_status(task_id, "Finalizada", execution_result.get("log"))
-        else:
-            raise Exception(execution_result.get("error", "Unknown error in OpenClaw"))
-            
-    except Exception as e:
-        logger.error(f"Error processing task: {e}")
-        handle_failure(task_data_json, str(e))
-
-def handle_failure(task_data_json: str, error_msg: str):
-    """
-    Moves the task to the error queue for audit.
-    """
-    client = redis.from_url(REDIS_URL, decode_responses=True)
-    try:
-        error_payload = {
-            "original_task": json.loads(task_data_json),
+        payload = {
+            "original_task": original_task,
             "error": error_msg,
-            "failed_at": time.time()
+            "failed_at": int(time.time()),
+            "worker": "hareware-openclaw-v1"
         }
-        client.lpush(ERROR_QUEUE, json.dumps(error_payload))
-        logger.info("Task moved to error queue.")
-    except Exception as e:
-        logger.error(f"Critical: Failed to push to error queue: {e}")
-    finally:
-        client.close()
+        redis_client.lpush(ERROR_QUEUE, json.dumps(payload))
+        logger.warning("Tarefa enviada para a fila de ERROS para auditoria.")
+    except Exception:
+        logger.exception("Falha crítica ao empurrar para a fila de erros.")
 
-def run_worker():
-    logger.info("Starting Redis Consumer Worker...")
+def update_task_status_api(task_id: str, status: str, log: str) -> bool:
+    """
+    Atualiza o status na API da HareWare.
+    """
+    if not task_id:
+        return False
+    url = f"{API_CALLBACK_URL.rstrip('/')}/{task_id}"
+    payload = {"status": status, "description": log}
     
-    while True:
-        client = None
+    for attempt in range(1, MAX_CALLBACK_RETRIES + 1):
         try:
-            client = redis.from_url(REDIS_URL, decode_responses=True)
-            logger.info(f"Connected to Redis. Monitoring {QUEUE_NAME}...")
+            resp = HTTP.put(url, json=payload, timeout=CALLBACK_TIMEOUT)
+            if 200 <= resp.status_code < 300:
+                logger.info("API HareWare atualizada: Task %s -> %s", task_id, status)
+                return True
+            logger.warning("API retornou status %s na tentativa %d", resp.status_code, attempt)
+        except requests.RequestException as e:
+            logger.warning("Erro de conexão com a API (Tentativa %d): %s", attempt, e)
+        
+        time.sleep(BACKOFF_BASE ** (attempt - 1))
+    
+    logger.error("Falha definitiva ao atualizar API para Task %s", task_id)
+    return False
+
+def call_openclaw_sessions_send(message_obj: dict) -> (bool, str):
+    """
+    Invoca a CLI do OpenClaw para enviar a mensagem à sessão do Lapin.
+    """
+    json_compact = json.dumps(message_obj, separators=(',', ':'))
+    cmd = [OPENCLAW_BIN, "sessions_send", f"--sessionKey={LAPIN_SESSION_KEY}", f"--message={json_compact}"]
+    
+    try:
+        logger.debug("Executando CLI OpenClaw...")
+        # Timeout aumentado para 120s conforme solicitado
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=CLI_TIMEOUT)
+        
+        combined_output = (proc.stdout or "") + (proc.stderr or "")
+        
+        if proc.returncode == 0:
+            logger.info("Comando 'sessions_send' executado com sucesso.")
+            return True, combined_output.strip()
+        else:
+            logger.error("CLI falhou (Exit Code %s): %s", proc.returncode, combined_output.strip())
+            return False, combined_output.strip()
             
-            while True:
-                # BLPOP blocks until an item is available
-                # Result is a tuple: (queue_name, item_value)
-                result = client.blpop(QUEUE_NAME, timeout=0)
+    except FileNotFoundError:
+        return False, f"Binário '{OPENCLAW_BIN}' não encontrado no sistema."
+    except subprocess.TimeoutExpired:
+        return False, f"Timeout: CLI OpenClaw excedeu os {CLI_TIMEOUT}s de execução."
+    except Exception as e:
+        return False, str(e)
+
+def build_external_event_message(task_data: dict) -> dict:
+    """
+    Mapeia os dados do seu sistema para o formato esperado pelo Lapin.
+    """
+    req_id = task_data.get("id") or f"gen-{int(time.time())}"
+    
+    return {
+        "type": "external.event",
+        "source": "webhook_redis_bridge",
+        "payload": {
+            "request_id": req_id,
+            "created_at": task_data.get("created_at") or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "action": {
+                "id": req_id,
+                "title": task_data.get("title", "Tarefa Sem Título"),
+                "description": task_data.get("description", ""),
+                "priority": task_data.get("priority", "normal"),
+                "metadata": task_data.get("metadata", {})
+            }
+        },
+        "text": f"Nova task da HareWare: {task_data.get('title')}"
+    }
+
+def process_item(redis_client: redis.Redis, raw_item: str):
+    """
+    Decodifica, formata e envia a tarefa com retentativas.
+    """
+    try:
+        task_data = json.loads(raw_item)
+    except Exception as e:
+        logger.error("Mensagem JSON inválida recebida: %s", e)
+        push_error_queue(redis_client, {"raw": raw_item}, "invalid_json")
+        return
+
+    task_id = task_data.get("id")
+    message_obj = build_external_event_message(task_data)
+
+    for attempt in range(1, MAX_SEND_ATTEMPTS + 1):
+        success, output = call_openclaw_sessions_send(message_obj)
+        
+        if success:
+            # Notifica a API que a tarefa entrou em processamento no Lapin
+            if os.getenv("UPDATE_API_AFTER_ENQUEUE", "true").lower() == "true":
+                update_task_status_api(task_id, "Em processamento", "Enviada com sucesso para o agente Lapin.")
+            return
+        
+        logger.warning("Falha ao enviar para OpenClaw (Tentativa %d/%d)", attempt, MAX_SEND_ATTEMPTS)
+        if attempt < MAX_SEND_ATTEMPTS:
+            time.sleep(BACKOFF_BASE ** (attempt - 1))
+
+    logger.error("Tarefa %s falhou após todas as tentativas.", task_id)
+    push_error_queue(redis_client, task_data, f"CLI_FAILURE: {output}")
+
+def run_loop():
+    logger.info("🚀 Worker HareWare iniciado. Monitorando Redis: %s", REDIS_URL)
+    
+    while not SHUTDOWN:
+        try:
+            # Recria a conexão se necessário dentro do loop principal
+            redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+            
+            while not SHUTDOWN:
+                # Timeout de 5s no blpop para verificar a flag SHUTDOWN periodicamente
+                result = redis_client.blpop(QUEUE_NAME, timeout=5)
+                
                 if result:
-                    _, task_data_json = result
-                    process_task(task_data_json)
+                    _, raw_item = result
+                    process_item(redis_client, raw_item)
                     
-        except redis.ConnectionError:
-            logger.error("Redis connection lost. Retrying in 5 seconds...")
+        except redis.ConnectionError as e:
+            logger.error("Conexão com Redis perdida: %s. Reconectando em 5s...", e)
             time.sleep(5)
         except Exception as e:
-            logger.error(f"Worker encountered an error: {e}")
-            time.sleep(5)
+            logger.exception("Erro inesperado no loop principal: %s", e)
+            time.sleep(2)
         finally:
-            if client:
-                client.close()
+            with suppress(Exception):
+                redis_client.close()
+
+    logger.info("Worker desligado com sucesso. Até logo!")
 
 if __name__ == "__main__":
-    run_worker()
+    run_loop()
