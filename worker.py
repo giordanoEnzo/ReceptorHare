@@ -81,6 +81,7 @@ def login_to_api():
 
 def push_error_queue(redis_client: redis.Redis, original_task: dict, error_msg: str):
     try:
+        task_id = original_task.get("id", "N/A")
         payload = {
             "original_task": original_task,
             "error": error_msg,
@@ -88,9 +89,9 @@ def push_error_queue(redis_client: redis.Redis, original_task: dict, error_msg: 
             "worker": "hareware-openclaw-v1"
         }
         redis_client.lpush(ERROR_QUEUE, json.dumps(payload))
-        logger.warning("Tarefa enviada para a fila de ERROS para auditoria.")
+        logger.warning("⚠️ Tarefa [%s] movida para a fila de ERROS: %s", task_id, error_msg)
     except Exception:
-        logger.exception("Falha crítica ao empurrar para a fila de erros.")
+        logger.exception("🚨 Falha crítica ao empurrar para a fila de erros.")
 
 def update_task_status_api(task_id: str, status: str, log: str) -> bool:
     """
@@ -113,7 +114,7 @@ def update_task_status_api(task_id: str, status: str, log: str) -> bool:
         
         time.sleep(BACKOFF_BASE ** (attempt - 1))
     
-    logger.error("Falha definitiva ao atualizar API para Task %s", task_id)
+    logger.error("❌ Falha definitiva ao atualizar API de status para Task %s após %d tentativas.", task_id, MAX_CALLBACK_RETRIES)
     return False
 
 def call_openclaw_sessions_send(message_obj: dict) -> (bool, str):
@@ -182,7 +183,20 @@ def build_external_event_message(task_data: dict) -> dict:
     metadata["confidence"] = task_data.get("confidence")
     metadata["effort"] = task_data.get("effort")
     metadata["deadline"] = task_data.get("deadline")
-    metadata["ticket_info"] = task_data.get("ticket")
+    metadata["ticket_info"] = task_data.get("ticket") or task_data.get("ticket_id")
+    metadata["ice_score"] = task_data.get("ice_score")
+    metadata["status"] = task_data.get("status")
+
+    # Mapeamento de prioridade baseado no ICE Score se o campo priority for nulo
+    priority = task_data.get("priority")
+    if not priority and task_data.get("ice_score"):
+        try:
+            score = int(task_data.get("ice_score", 0))
+            if score >= 20: priority = "high"
+            elif score >= 10: priority = "normal"
+            else: priority = "low"
+        except (ValueError, TypeError):
+            priority = "normal"
 
     return {
         "type": "external.event",
@@ -194,7 +208,7 @@ def build_external_event_message(task_data: dict) -> dict:
                 "id": req_id,
                 "title": task_data.get("title", "Tarefa Sem Título"),
                 "description": task_data.get("description", ""),
-                "priority": str(task_data.get("priority", "normal")), # ICE Score convertido para string
+                "priority": str(priority or "normal"),
                 "metadata": metadata
             }
         },
@@ -213,6 +227,9 @@ def process_item(redis_client: redis.Redis, raw_item: str):
         return
 
     task_id = task_data.get("id")
+    task_title = task_data.get("title", "Sem título")
+    logger.info("📦 Processando nova tarefa do Redis: [%s] %s", task_id, task_title)
+
     notification_url = task_data.get("notification_url")
 
     # 1. Forward to Webhook if available
@@ -242,9 +259,10 @@ def process_item(redis_client: redis.Redis, raw_item: str):
         # Notifica a API que a tarefa entrou em processamento
         if os.getenv("UPDATE_API_AFTER_ENQUEUE", "true").lower() == "true":
             update_task_status_api(task_id, "Em processamento", "Tarefa encaminhada com sucesso.")
+        logger.info("✅ Tarefa [%s] processada com sucesso.", task_id)
         return
 
-    logger.error("Tarefa %s falhou (Webhook e CLI).", task_id)
+    logger.error("🚨 ERRO CRÍTICO: Tarefa [%s] falhou em todos os destinos (Webhook e CLI).", task_id)
     push_error_queue(redis_client, task_data, f"FAILURE: Webhook({webhook_success}), CLI({cli_success}) - {cli_output}")
 
 def run_loop():
