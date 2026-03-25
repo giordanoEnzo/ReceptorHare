@@ -258,7 +258,7 @@ def process_item(redis_client: redis.Redis, raw_item: str):
     if webhook_success or cli_success:
         # Notifica a API que a tarefa entrou em processamento
         if os.getenv("UPDATE_API_AFTER_ENQUEUE", "true").lower() == "true":
-            update_task_status_api(task_id, "Em processamento", "Tarefa encaminhada com sucesso.")
+            update_task_status_api(task_id, "Execução", "Tarefa encaminhada com sucesso.")
         logger.info("✅ Tarefa [%s] processada com sucesso.", task_id)
         return
 
