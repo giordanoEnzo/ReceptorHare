@@ -176,6 +176,13 @@ def build_external_event_message(task_data: dict) -> dict:
 
     metadata = task_data.get("metadata", {})
     metadata["action_type"] = action_type
+    
+    # Adicionar novos campos do sistema Hare
+    metadata["impact"] = task_data.get("impact")
+    metadata["confidence"] = task_data.get("confidence")
+    metadata["effort"] = task_data.get("effort")
+    metadata["deadline"] = task_data.get("deadline")
+    metadata["ticket_info"] = task_data.get("ticket")
 
     return {
         "type": "external.event",
@@ -187,7 +194,7 @@ def build_external_event_message(task_data: dict) -> dict:
                 "id": req_id,
                 "title": task_data.get("title", "Tarefa Sem Título"),
                 "description": task_data.get("description", ""),
-                "priority": task_data.get("priority", "normal"),
+                "priority": str(task_data.get("priority", "normal")), # ICE Score convertido para string
                 "metadata": metadata
             }
         },
